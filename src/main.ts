@@ -46,9 +46,11 @@ interface GlowCfg {
   cascade: number; // 0..1 neighbor activation level
   trace: number; // 0..0.5 persistent session-trail tint
 }
-// decay knob 0..1 -> visible fade time in real seconds (0.5 ~= 7s)
+// decay knob 0..1 -> visible fade time in real seconds (0.5 ~= 7s).
+// Negative (-1) = never fade: Infinity makes the decay factor exp(0) = 1.
 function decayKnobToSecs(knob: number): number {
-  return Math.max(0.15, Math.min(1, Math.max(0, knob)) * 14);
+  if (knob < 0) return Infinity;
+  return Math.max(0.15, Math.min(1, knob) * 14);
 }
 function parseGlowConfig(raw: string, useDefaults: boolean): GlowCfg {
   let color = hexToInt(GLOW_DEFAULTS.color),
@@ -66,7 +68,8 @@ function parseGlowConfig(raw: string, useDefaults: boolean): GlowCfg {
       if (typeof c.writeColor === "string")
         writeColor = hexToInt(c.writeColor, writeColor); // bad value keeps orange, not green
       if (typeof c.swell === "number") swell = Math.max(0, c.swell);
-      if (typeof c.hold === "number") holdSecs = Math.max(0, Math.min(30, c.hold));
+      if (typeof c.hold === "number")
+        holdSecs = c.hold < 0 ? Infinity : Math.min(30, c.hold); // -1 = hold forever
       if (typeof c.decay === "number") knob = c.decay;
       if (typeof c.pulse === "number") pulseAmp = Math.max(0, Math.min(0.9, c.pulse));
       if (typeof c.cascade === "number") cascade = Math.max(0, Math.min(1, c.cascade));
@@ -555,12 +558,16 @@ class GlowController {
   }
 
   clearTrail() {
-    for (const id of [...this.traced.keys()]) {
-      if (!this.activation.has(id)) this.restoreNode(id);
-    }
+    // full reset: trail AND live glows (incl. hold:-1 "forever" highlights)
+    for (const id of [...this.traced.keys()]) this.restoreNode(id);
+    for (const id of [...this.activation.keys()]) this.restoreNode(id);
     this.traced.clear();
+    this.activation.clear();
+    this.holdUntil.clear();
+    this.transient.clear();
+    this.lastK.clear();
     this.forceRender();
-    new Notice("Neural Vault: session trail cleared");
+    new Notice("Neural Vault: highlights cleared");
   }
 
   testPulse() {
@@ -943,8 +950,8 @@ class NeuralSettingTab extends PluginSettingTab {
     li('<code>color</code> — Read glow, hex string e.g. <code>"#3BDB63"</code>');
     li('<code>writeColor</code> — Edit/Write glow, e.g. <code>"#FF8C42"</code>');
     li('<code>swell</code> — node growth; <code>2.0</code> ≈ 3× size, <code>0</code> = none');
-    li('<code>hold</code> — seconds at full brightness before fading (e.g. <code>2.5</code>)');
-    li('<code>decay</code> — fade length <code>0</code>–<code>1</code> (0.1 quick · 0.5 medium · 1 long)');
+    li('<code>hold</code> — seconds at full brightness before fading; <code>-1</code> = stay lit until cleared');
+    li('<code>decay</code> — fade length <code>0</code>–<code>1</code> (0.1 quick · 0.5 medium · 1 long); <code>-1</code> = never fade');
     li('<code>pulse</code> — throb <code>0</code>–<code>0.9</code> (<code>0</code> = steady)');
     li('<code>cascade</code> — neighbor spread <code>0</code>–<code>1</code> (<code>0</code> = off)');
     li('<code>trace</code> — session-trail tint <code>0</code>–<code>0.5</code> (<code>0</code> = off)');
