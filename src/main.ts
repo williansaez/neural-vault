@@ -62,8 +62,9 @@ function parseGlowConfig(raw: string, useDefaults: boolean): GlowCfg {
   if (!useDefaults) {
     try {
       const c = JSON.parse(raw);
-      if (typeof c.color === "string") color = hexToInt(c.color);
-      if (typeof c.writeColor === "string") writeColor = hexToInt(c.writeColor);
+      if (typeof c.color === "string") color = hexToInt(c.color, color);
+      if (typeof c.writeColor === "string")
+        writeColor = hexToInt(c.writeColor, writeColor); // bad value keeps orange, not green
       if (typeof c.swell === "number") swell = Math.max(0, c.swell);
       if (typeof c.hold === "number") holdSecs = Math.max(0, Math.min(30, c.hold));
       if (typeof c.decay === "number") knob = c.decay;
@@ -147,10 +148,18 @@ export default class NeuralVaultPlugin extends Plugin {
       };
       const debugOn = this.settings.debugEndpoints;
       if (req.method === "POST" && req.url === "/read") {
+        // Write/Edit hook payloads carry full file contents — cap what we buffer
+        const MAX_BODY = 4 * 1024 * 1024;
         let body = "";
-        req.on("data", (c) => (body += c));
+        let truncated = false;
+        req.on("data", (c) => {
+          if (body.length < MAX_BODY) body += c;
+          else truncated = true;
+        });
         req.on("end", () => {
-          const ev = this.extractEvent(body);
+          // file_path lives at the head of the JSON; a truncated tail still parses
+          // if we got lucky, otherwise extractEvent returns null and we drop it
+          const ev = this.extractEvent(truncated ? body.slice(0, 64 * 1024) : body);
           if (ev) this.glow.activate(ev.path, ev.kind);
           ok("ok");
         });
@@ -187,7 +196,10 @@ export default class NeuralVaultPlugin extends Plugin {
         // diagnostic: run EVERY node through the normal glow pipeline
         const r = this.glow.getGraphRenderer();
         if (r) {
-          for (const n of r.nodes) this.glow.activation.set(n.id, 1);
+          for (const n of r.nodes) {
+            this.glow.activation.set(n.id, 1);
+            this.glow.transient.add(n.id); // diagnostics never leave a trail
+          }
           this.glow.ensureLoop();
         }
         ok("pulse-all " + (r?.nodes?.length ?? 0));
@@ -290,18 +302,35 @@ export default class NeuralVaultPlugin extends Plugin {
 
   extractEvent(body: string): { path: string; kind: "read" | "write" } | null {
     try {
-      const j = JSON.parse(body);
-      const abs: string | undefined =
-        j?.tool_input?.file_path ?? j?.file_path ?? undefined;
+      let abs: string | undefined;
+      let toolName: string | undefined;
+      try {
+        const j = JSON.parse(body);
+        abs =
+          j?.tool_input?.file_path ??
+          j?.tool_input?.notebook_path ?? // NotebookEdit uses notebook_path
+          j?.file_path ??
+          undefined;
+        toolName = j?.tool_name;
+      } catch {
+        // truncated payload (huge Write bodies): both fields live near the head
+        abs = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)+)"/.exec(body)?.[1];
+        toolName = /"tool_name"\s*:\s*"([^"]+)"/.exec(body)?.[1];
+        if (abs) abs = JSON.parse(`"${abs}"`); // unescape
+      }
       if (!abs) return null;
       const base: string | undefined = (this.app.vault.adapter as any).basePath;
       // only light up files that actually belong to THIS vault — with several
       // vaults open, suffix matching could otherwise glow the wrong graph
-      if (base && abs.startsWith("/") && !abs.startsWith(base)) return null;
-      let rel = abs;
-      if (base && abs.startsWith(base)) rel = abs.slice(base.length);
-      const tool: string = j?.tool_name ?? "Read";
-      const kind = /^(Edit|Write|MultiEdit|NotebookEdit)$/i.test(tool)
+      const isAbsolute = /^([/\\]|[A-Za-z]:[/\\])/.test(abs);
+      const inVault =
+        !!base &&
+        abs.startsWith(base) &&
+        // boundary check: "/Vaults/Work" must not match "/Vaults/Work-Archive"
+        (abs.length === base.length || abs[base.length] === "/" || abs[base.length] === "\\");
+      if (base && isAbsolute && !inVault) return null;
+      const rel = inVault ? abs.slice(base!.length) : abs;
+      const kind = /^(Edit|Write|MultiEdit|NotebookEdit)$/i.test(toolName ?? "Read")
         ? ("write" as const)
         : ("read" as const);
       return { path: rel.replace(/^[/\\]+/, ""), kind };
@@ -328,8 +357,26 @@ class GlowController {
   traced = new Map<string, "read" | "write">(); // session trail: faded nodes keep a tint
   reverseLinks: Map<string, Set<string>> | null = null; // backlink index for cascade
 
+  cachedCfg: GlowCfg | null = null;
+  cachedCfgKey = "";
+  disposed = false; // set on detach; blocks late HTTP callbacks from resurrecting the loop
+  transient = new Set<string>(); // test-pulse activations: never leave a trail
+  lastK = new Map<string, number>(); // last painted brightness, to skip redundant renders
+  traceCursor = 0; // round-robin index for amortized trail reasserts
+  lastIndexRebuild = 0;
+
   constructor(plugin: NeuralVaultPlugin) {
     this.plugin = plugin;
+  }
+
+  getCfg(): GlowCfg {
+    const s = this.plugin.settings;
+    const key = (s.advanced ? "1" : "0") + s.glowConfig;
+    if (!this.cachedCfg || this.cachedCfgKey !== key) {
+      this.cachedCfg = parseGlowConfig(s.glowConfig, !s.advanced);
+      this.cachedCfgKey = key;
+    }
+    return this.cachedCfg;
   }
 
   getGraphRenderer(): any {
@@ -357,6 +404,7 @@ class GlowController {
   }
 
   detach() {
+    this.disposed = true; // late HTTP callbacks must not resurrect the loop
     this.stopLoop();
     // leave the graph exactly as we found it
     for (const id of [...this.activation.keys()]) this.restoreNode(id);
@@ -364,6 +412,8 @@ class GlowController {
     this.activation.clear();
     this.traced.clear();
     this.holdUntil.clear();
+    this.transient.clear();
+    this.lastK.clear();
     this.forceRender();
     this.renderer = null;
   }
@@ -373,37 +423,53 @@ class GlowController {
   // graph view being closed/reopened.
   loopWanted(): boolean {
     const s = this.plugin.settings;
-    return s.keepAwake || s.animateNodes || this.activation.size > 0;
+    return (
+      s.keepAwake || s.animateNodes || this.activation.size > 0 || this.traced.size > 0
+    );
   }
 
   ensureLoop() {
+    if (this.disposed) return;
     if (this.rafId != null) return;
     const loop = () => {
-      const s = this.plugin.settings;
-      const r = this.getGraphRenderer();
-      if (r) {
+      // schedule first: a throw in the body must never kill the loop for good
+      this.rafId = this.loopWanted() && !this.disposed
+        ? window.requestAnimationFrame(loop)
+        : null;
+      try {
+        const s = this.plugin.settings;
+        const r = this.getGraphRenderer();
+        if (!r) return;
         this.renderer = r;
         const active = this.activation.size > 0;
         if (s.keepAwake || s.animateNodes) r.idleFrames = 0; // disable cooldown
         if (active) this.applyGlow();
         const moving = s.animateNodes ? this.keepPhysicsWarm(r) : false;
         this.frame++;
-        // session trail: engine repaints can wipe the tint — re-assert periodically
-        if (this.traced.size && this.frame % TRACE_REASSERT_EVERY === 0) {
-          const cfg = parseGlowConfig(s.glowConfig, !s.advanced);
-          for (const id of this.traced.keys()) {
-            if (!this.activation.has(id)) this.paintTrace(id, cfg);
+        // session trail: engine repaints can wipe the tint — re-assert a small
+        // slice per frame (round-robin) instead of all traced nodes at once
+        let traceTouched = false;
+        if (this.traced.size) {
+          const cfg = this.getCfg();
+          const ids = [...this.traced.keys()];
+          const per = Math.max(1, Math.ceil(ids.length / TRACE_REASSERT_EVERY));
+          for (let i = 0; i < per; i++) {
+            const id = ids[(this.traceCursor + i) % ids.length];
+            if (!this.activation.has(id)) {
+              this.paintTrace(id, cfg);
+              traceTouched = true;
+            }
           }
+          this.traceCursor = (this.traceCursor + per) % ids.length;
         }
         const idleTick = s.keepAwake && this.frame % IDLE_RENDER_EVERY === 0;
-        if (active || moving || idleTick) this.forceRender();
+        if (active || moving || (traceTouched && idleTick) || idleTick) {
+          this.forceRender();
+        }
+      } catch (e) {
+        console.error("[Neural Vault] loop error (continuing)", e);
       }
-      if (this.loopWanted()) {
-        this.rafId = window.requestAnimationFrame(loop);
-      } else {
-        this.rafId = null;
-        this.forceRender(); // final repaint after restore
-      }
+      if (this.rafId == null) this.forceRender(); // final repaint after restore
     };
     this.rafId = window.requestAnimationFrame(loop);
   }
@@ -430,6 +496,7 @@ class GlowController {
   }
 
   activate(path: string, kind: "read" | "write" = "read") {
+    if (this.disposed) return;
     if (!this.ensureAttached()) return;
     const node = this.findNode(path);
     if (!node) {
@@ -437,28 +504,30 @@ class GlowController {
       return;
     }
     const id = this.nodeId(node);
-    const cfg = parseGlowConfig(
-      this.plugin.settings.glowConfig,
-      !this.plugin.settings.advanced
-    );
+    const cfg = this.getCfg();
     const now = performance.now();
     this.activation.set(id, 1);
     this.kinds.set(id, kind);
     this.holdUntil.set(id, now + cfg.holdSecs * 1000);
+    this.lastK.delete(id);
     this.traced.delete(id); // back to live glow; re-traced when it fades out
 
     // cascade: light direct neighbors at reduced brightness (synaptic spread)
     if (cfg.cascade > 0) {
       for (const nb of this.neighborsOf(id)) {
-        const cur = this.activation.get(nb) ?? 0;
-        if (cur >= cfg.cascade) continue; // never dim a stronger activation
-        this.activation.set(nb, cfg.cascade);
-        if (!this.kinds.has(nb)) this.kinds.set(nb, kind);
-        // neighbors get a shorter hold so the source stays the protagonist
+        // only nodes actually present in the current graph view — tracing a
+        // node we never painted would corrupt its "original color" later
+        if (!this.nodeByIdFast(nb)) continue;
+        // refresh the (shorter) neighbor hold even if already at cascade level
         this.holdUntil.set(
           nb,
           Math.max(this.holdUntil.get(nb) ?? 0, now + cfg.holdSecs * 400)
         );
+        const cur = this.activation.get(nb) ?? 0;
+        if (cur >= cfg.cascade) continue; // never dim a stronger activation
+        this.activation.set(nb, cfg.cascade);
+        if (!this.kinds.has(nb)) this.kinds.set(nb, kind);
+        this.lastK.delete(nb);
         this.traced.delete(nb);
       }
     }
@@ -503,15 +572,15 @@ class GlowController {
     }
     // light the 150 most-connected nodes so the effect is unmistakable
     nodes.sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0));
-    const cfg = parseGlowConfig(
-      this.plugin.settings.glowConfig,
-      !this.plugin.settings.advanced
-    );
+    const cfg = this.getCfg();
     const until = performance.now() + cfg.holdSecs * 1000;
     const sample = nodes.slice(0, 150);
     for (const n of sample) {
-      this.activation.set(this.nodeId(n), 1);
-      this.holdUntil.set(this.nodeId(n), until);
+      const id = this.nodeId(n);
+      this.activation.set(id, 1);
+      this.holdUntil.set(id, until);
+      this.transient.add(id); // test pulse must not pollute the session trail
+      this.lastK.delete(id);
     }
     this.ensureLoop();
     new Notice(`Neural Vault: pulsed ${sample.length} top nodes`);
@@ -542,7 +611,17 @@ class GlowController {
       for (const n of nodes) this.nodeIndex.set(n.id, n);
       this.nodeIndexCount = nodes.length;
     }
-    return this.nodeIndex.get(id) ?? null;
+    let hit = this.nodeIndex.get(id);
+    // equal-count swaps (rename) keep the count but change ids — on a miss,
+    // rebuild at most once per 2s so we don't serve destroyed node objects
+    if (!hit && performance.now() - this.lastIndexRebuild > 2000) {
+      this.lastIndexRebuild = performance.now();
+      this.nodeIndex.clear();
+      for (const n of nodes) this.nodeIndex.set(n.id, n);
+      this.nodeIndexCount = nodes.length;
+      hit = this.nodeIndex.get(id);
+    }
+    return hit ?? null;
   }
 
   findNode(path: string): any | null {
@@ -588,11 +667,15 @@ class GlowController {
     this.origColor.delete(id);
     this.origScale.delete(id);
     this.kinds.delete(id);
+    this.lastK.delete(id);
+    this.transient.delete(id);
   }
 
   // a glow finished fading: either restore fully or leave the session-trail tint
   onFadeOut(id: string, cfg: GlowCfg) {
-    if (cfg.trace > 0) {
+    const wasPainted = this.origColor.has(id); // node existed and we touched it
+    const isTransient = this.transient.delete(id); // test pulses leave no trail
+    if (cfg.trace > 0 && wasPainted && !isTransient) {
       this.traced.set(id, this.kinds.get(id) ?? "read");
       this.paintTrace(id, cfg);
       // scale back to normal — only the tint stays
@@ -618,11 +701,9 @@ class GlowController {
   // official path the renderer reads (circle.tint gets clobbered by node.render).
   applyGlow() {
     const t = performance.now();
-    const cfg = parseGlowConfig(
-      this.plugin.settings.glowConfig,
-      !this.plugin.settings.advanced
-    );
-    const pulse = 1 - cfg.pulseAmp + cfg.pulseAmp * Math.sin(t * 0.008);
+    const cfg = this.getCfg();
+    // throb between (1 - pulseAmp) and 1 — never negative, no color extrapolation
+    const pulse = 1 - cfg.pulseAmp * (0.5 - 0.5 * Math.sin(t * 0.008));
     // wall-clock decay: brightness hits ~1% after decaySecs, at any frame rate
     const dt = this.lastGlowTs > 0 ? Math.min(0.25, (t - this.lastGlowTs) / 1000) : 0;
     this.lastGlowTs = t;
@@ -635,7 +716,18 @@ class GlowController {
       painted++;
       this.capture(id, n);
       // sqrt curve: color/size stay perceptually strong much longer into the fade
-      const k = Math.min(1, Math.sqrt(a) * pulse);
+      const k = Math.max(0, Math.min(1, Math.sqrt(a) * pulse));
+      // hold phase with no pulse = constant k: skip the PIXI rebuild, but still
+      // re-assert every few frames in case the engine repainted over us
+      const prevK = this.lastK.get(id);
+      if (
+        prevK !== undefined &&
+        Math.abs(prevK - k) < 0.004 &&
+        this.frame % IDLE_RENDER_EVERY !== 0
+      ) {
+        continue;
+      }
+      this.lastK.set(id, k);
       const base = this.origColor.get(id);
       const fromRgb = base && typeof base.rgb === "number" ? base.rgb : 0x888f9c;
       const kindColor = this.kinds.get(id) === "write" ? cfg.writeColor : cfg.color;
@@ -656,6 +748,7 @@ class GlowController {
         this.onFadeOut(id, cfg);
         this.activation.delete(id);
         this.holdUntil.delete(id);
+        this.lastK.delete(id);
       } else {
         this.activation.set(id, nv);
       }
@@ -781,15 +874,19 @@ class NeuralSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Listener port")
       .setDesc(
-        "Localhost port the Claude Code hook posts to (default 8765). Use a different port per vault if you run several at once. Requires reload; remember to update the port in the vault's .claude/settings.json hook too."
+        "Localhost port the Claude Code hook posts to (default 8765). Use a different port per vault if you run several at once. Applies immediately; remember to update the port in the vault's .claude/settings.json hook too."
       )
       .addText((tx) =>
         tx.setValue(String(this.plugin.settings.port)).onChange(async (v) => {
           const p = parseInt(v, 10);
-          if (p >= 1024 && p <= 65535) {
-            this.plugin.settings.port = p;
-            await this.plugin.saveSettings();
-          }
+          if (!Number.isInteger(p) || p < 1024 || p > 65535) return;
+          if (p === this.plugin.settings.port) return;
+          this.plugin.settings.port = p;
+          await this.plugin.saveSettings();
+          // restart the listener on the new port right away
+          this.plugin.stopServer();
+          this.plugin.startServer();
+          new Notice(`Neural Vault: listening on 127.0.0.1:${p}`);
         })
       );
 
@@ -896,10 +993,10 @@ class NeuralSettingTab extends PluginSettingTab {
   }
 }
 
-function hexToInt(hex: string): number {
+function hexToInt(hex: string, fallback = 0x3bdb63): number {
   const m = /^#?([0-9a-f]{6})$/i.exec((hex || "").trim());
   if (m) return parseInt(m[1], 16);
-  return 0x3bdb63; // vivid green fallback
+  return fallback;
 }
 
 function lerpInt(a: number, b: number, t: number): number {
