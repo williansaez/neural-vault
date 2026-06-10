@@ -33,7 +33,7 @@ The plugin drives Obsidian's built-in PIXI graph renderer directly — no separa
 
 ## Connect Claude Code
 
-Add these hooks to `<vault>/.claude/settings.json` — reads glow green, edits/writes glow orange:
+Add these hooks to `<vault>/.claude/settings.json` — reads glow green, edits/writes glow red:
 
 ```json
 {
@@ -68,7 +68,7 @@ Then run `claude` inside the vault, ask it to read some notes, and watch the gra
 
 ## Features
 
-- **Read vs write colors** — files Claude reads flash green, files it edits/creates flash orange.
+- **Read vs write colors** — files Claude reads flash green (#00ff00), files it edits/creates flash red (#ff0000).
 - **Neural cascade** — an activated node spreads attenuated light to its linked neighbors, like a synapse firing.
 - **Session trail** — faded nodes keep a faint tint, so you can see the path Claude walked through your vault. Clear it with the *Clear session trail* command (or `POST /clear-trail`).
 - **Always alive** — render cooldown disabled and force simulation kept warm; the graph keeps drifting under its real physics.

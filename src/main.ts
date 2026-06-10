@@ -16,8 +16,8 @@ interface NeuralSettings {
 }
 // Simple-mode defaults (also the starting point for the advanced JSON box)
 const GLOW_DEFAULTS = {
-  color: "#3BDB63", // Read glow
-  writeColor: "#FF8C42", // Edit/Write glow
+  color: "#00ff00", // Read glow
+  writeColor: "#ff0000", // Edit/Write glow
   swell: 2.0,
   hold: 2.5,
   decay: 0.5,
@@ -66,7 +66,7 @@ function parseGlowConfig(raw: string, useDefaults: boolean): GlowCfg {
       const c = JSON.parse(raw);
       if (typeof c.color === "string") color = hexToInt(c.color, color);
       if (typeof c.writeColor === "string")
-        writeColor = hexToInt(c.writeColor, writeColor); // bad value keeps orange, not green
+        writeColor = hexToInt(c.writeColor, writeColor); // bad value keeps red, not green
       if (typeof c.swell === "number") swell = Math.max(0, c.swell);
       if (typeof c.hold === "number")
         holdSecs = c.hold < 0 ? Infinity : Math.min(30, c.hold); // -1 = hold forever
@@ -222,7 +222,7 @@ export default class NeuralVaultPlugin extends Plugin {
         // diagnostic: replicate the proven mass-color test (node.color + render)
         const r = this.glow.getGraphRenderer();
         const m = /rgb=([0-9a-fA-F]{6})/.exec(req.url ?? "");
-        const rgb = m ? parseInt(m[1], 16) : 0x3bdb63;
+        const rgb = m ? parseInt(m[1], 16) : 0x00ff00;
         let painted = 0;
         if (r) {
           for (const n of r.nodes) {
@@ -851,7 +851,7 @@ class NeuralSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Advanced highlight")
       .setDesc(
-        "Off: green (#3BDB63), swell 2.0, medium fade, no pulse. On: edit the full highlight style as JSON below."
+        "Off: reads glow green (#00ff00), writes glow red (#ff0000), swell 2.0, medium fade. On: edit the full highlight style as JSON below."
       )
       .addToggle((t) =>
         t.setValue(this.plugin.settings.advanced).onChange(async (v) => {
@@ -947,8 +947,8 @@ class NeuralSettingTab extends PluginSettingTab {
     const li = (html: string) => {
       legend.createEl("li").innerHTML = html;
     };
-    li('<code>color</code> — Read glow, hex string e.g. <code>"#3BDB63"</code>');
-    li('<code>writeColor</code> — Edit/Write glow, e.g. <code>"#FF8C42"</code>');
+    li('<code>color</code> — Read glow, hex string e.g. <code>"#00ff00"</code>');
+    li('<code>writeColor</code> — Edit/Write glow, e.g. <code>"#ff0000"</code>');
     li('<code>swell</code> — node growth; <code>2.0</code> ≈ 3× size, <code>0</code> = none');
     li('<code>hold</code> — seconds at full brightness before fading; <code>-1</code> = stay lit until cleared');
     li('<code>decay</code> — fade length <code>0</code>–<code>1</code> (0.1 quick · 0.5 medium · 1 long); <code>-1</code> = never fade');
@@ -1000,7 +1000,7 @@ class NeuralSettingTab extends PluginSettingTab {
   }
 }
 
-function hexToInt(hex: string, fallback = 0x3bdb63): number {
+function hexToInt(hex: string, fallback = 0x00ff00): number {
   const m = /^#?([0-9a-f]{6})$/i.exec((hex || "").trim());
   if (m) return parseInt(m[1], 16);
   return fallback;
