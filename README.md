@@ -33,7 +33,7 @@ The plugin drives Obsidian's built-in PIXI graph renderer directly — no separa
 
 ## Connect Claude Code
 
-Add this hook to `<vault>/.claude/settings.json`:
+Add these hooks to `<vault>/.claude/settings.json` — reads glow green, edits/writes glow orange:
 
 ```json
 {
@@ -41,6 +41,15 @@ Add this hook to `<vault>/.claude/settings.json`:
     "PostToolUse": [
       {
         "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -s --max-time 1 -X POST http://127.0.0.1:8765/read --data-binary @- >/dev/null 2>&1"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [
           {
             "type": "command",
@@ -57,18 +66,28 @@ Then run `claude` inside the vault, ask it to read some notes, and watch the gra
 
 > **Note:** the Claude desktop app (Cowork) does not fire hooks — use the Claude Code CLI.
 
+## Features
+
+- **Read vs write colors** — files Claude reads flash green, files it edits/creates flash orange.
+- **Neural cascade** — an activated node spreads attenuated light to its linked neighbors, like a synapse firing.
+- **Session trail** — faded nodes keep a faint tint, so you can see the path Claude walked through your vault. Clear it with the *Clear session trail* command (or `POST /clear-trail`).
+- **Always alive** — render cooldown disabled and force simulation kept warm; the graph keeps drifting under its real physics.
+
 ## Settings
 
 - **Keep graph always awake** — never let the graph render loop sleep, so highlights animate fully.
-- **Advanced highlight** — off: green `#3BDB63`, 3× swell, ~2.5 s hold, medium fade. On: edit the style as JSON (`color`, `swell`, `hold`, `decay`, `pulse`).
+- **Advanced highlight** — off: sensible defaults. On: edit the style as JSON (`color`, `writeColor`, `swell`, `hold`, `decay`, `pulse`, `cascade`, `trace`).
 - **Keep graph alive (physics)** + **Liveliness** — keep the force simulation running so the graph never freezes.
+- **Listener port** — default `8765`; use one port per vault if you run several at once (update the hook too).
+- **Debug endpoints** — exposes extra localhost endpoints for development.
 
-## Dev/debug endpoints (localhost only)
+## Endpoints (localhost only)
 
-`POST /read` (the hook target) · `GET /status` · `POST /pulse` · `POST /pulse-all` · `POST /paint-all` · `POST /unpaint` · `POST /reset-view?scale=` · `GET /probe-green` · `POST /reload`
+Always on: `POST /read` (hook target) · `GET /status` · `POST /pulse` · `POST /clear-trail`
+With debug enabled: `POST /pulse-all` · `POST /paint-all` · `POST /unpaint` · `POST /reset-view?scale=` · `GET /probe-green` · `POST /reload`
 
 ## Beta caveats
 
 - Relies on **undocumented** internals of the core graph view — an Obsidian update may break it.
-- Desktop only (`isDesktopOnly`), fixed port `8765`.
+- Desktop only (`isDesktopOnly`).
 - Tested on Obsidian 1.12.x, macOS.

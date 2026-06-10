@@ -1,19 +1,30 @@
 import { Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 import * as http from "http";
 
-const PORT = 8765;
 const IDLE_RENDER_EVERY = 6; // when awake but no glow, repaint every Nth frame (~10fps)
 const REHEAT_EVERY_MS = 450; // how often to top up the physics sim
+const TRACE_REASSERT_EVERY = 30; // frames between re-painting session-trail nodes
 
 interface NeuralSettings {
   keepAwake: boolean;
   animateNodes: boolean;
   liveliness: number; // physics alpha topped up each cycle (0 = still, ~0.3 = very lively)
   advanced: boolean; // when off, use the fixed defaults below; when on, use glowConfig
-  glowConfig: string; // JSON: { color, swell, decay, pulse }
+  glowConfig: string; // JSON: { color, writeColor, swell, hold, decay, pulse, cascade, trace }
+  port: number; // localhost listener port
+  debugEndpoints: boolean; // expose /paint-all, /pulse-all, /probe-green, /reset-view
 }
 // Simple-mode defaults (also the starting point for the advanced JSON box)
-const GLOW_DEFAULTS = { color: "#3BDB63", swell: 2.0, hold: 2.5, decay: 0.5, pulse: 0 };
+const GLOW_DEFAULTS = {
+  color: "#3BDB63", // Read glow
+  writeColor: "#FF8C42", // Edit/Write glow
+  swell: 2.0,
+  hold: 2.5,
+  decay: 0.5,
+  pulse: 0,
+  cascade: 0.45, // neighbor brightness (0 = off)
+  trace: 0.18, // session-trail tint strength (0 = off)
+};
 const DEFAULT_GLOW = JSON.stringify(GLOW_DEFAULTS, null, 2);
 const DEFAULT_SETTINGS: NeuralSettings = {
   keepAwake: true,
@@ -21,14 +32,19 @@ const DEFAULT_SETTINGS: NeuralSettings = {
   liveliness: 0.1,
   advanced: false,
   glowConfig: DEFAULT_GLOW,
+  port: 8765,
+  debugEndpoints: false,
 };
 
 interface GlowCfg {
   color: number;
+  writeColor: number;
   swell: number;
   holdSecs: number; // time at full brightness before fading starts
   decaySecs: number; // wall-clock fade time — frame-rate independent
   pulseAmp: number;
+  cascade: number; // 0..1 neighbor activation level
+  trace: number; // 0..0.5 persistent session-trail tint
 }
 // decay knob 0..1 -> visible fade time in real seconds (0.5 ~= 7s)
 function decayKnobToSecs(knob: number): number {
@@ -36,23 +52,38 @@ function decayKnobToSecs(knob: number): number {
 }
 function parseGlowConfig(raw: string, useDefaults: boolean): GlowCfg {
   let color = hexToInt(GLOW_DEFAULTS.color),
+    writeColor = hexToInt(GLOW_DEFAULTS.writeColor),
     swell = GLOW_DEFAULTS.swell,
     holdSecs = GLOW_DEFAULTS.hold,
     knob = GLOW_DEFAULTS.decay,
-    pulseAmp = GLOW_DEFAULTS.pulse;
+    pulseAmp = GLOW_DEFAULTS.pulse,
+    cascade = GLOW_DEFAULTS.cascade,
+    trace = GLOW_DEFAULTS.trace;
   if (!useDefaults) {
     try {
       const c = JSON.parse(raw);
       if (typeof c.color === "string") color = hexToInt(c.color);
+      if (typeof c.writeColor === "string") writeColor = hexToInt(c.writeColor);
       if (typeof c.swell === "number") swell = Math.max(0, c.swell);
       if (typeof c.hold === "number") holdSecs = Math.max(0, Math.min(30, c.hold));
       if (typeof c.decay === "number") knob = c.decay;
       if (typeof c.pulse === "number") pulseAmp = Math.max(0, Math.min(0.9, c.pulse));
+      if (typeof c.cascade === "number") cascade = Math.max(0, Math.min(1, c.cascade));
+      if (typeof c.trace === "number") trace = Math.max(0, Math.min(0.5, c.trace));
     } catch {
       /* invalid JSON -> defaults */
     }
   }
-  return { color, swell, holdSecs, decaySecs: decayKnobToSecs(knob), pulseAmp };
+  return {
+    color,
+    writeColor,
+    swell,
+    holdSecs,
+    decaySecs: decayKnobToSecs(knob),
+    pulseAmp,
+    cascade,
+    trace,
+  };
 }
 
 export default class NeuralVaultPlugin extends Plugin {
@@ -75,7 +106,18 @@ export default class NeuralVaultPlugin extends Plugin {
       callback: () => this.glow.testPulse(),
     });
 
+    this.addCommand({
+      id: "neural-vault-clear-trail",
+      name: "Clear session trail",
+      callback: () => this.glow.clearTrail(),
+    });
+
     this.startServer();
+
+    // cascade uses a backlink index built from resolvedLinks; invalidate on change
+    this.registerEvent(
+      this.app.metadataCache.on("resolved", () => (this.glow.reverseLinks = null))
+    );
 
     // start the master loop (render-awake + node breathing) if either is on
     if (this.settings.keepAwake || this.settings.animateNodes) {
@@ -103,14 +145,18 @@ export default class NeuralVaultPlugin extends Plugin {
         res.writeHead(200, { "Content-Type": type });
         res.end(body);
       };
+      const debugOn = this.settings.debugEndpoints;
       if (req.method === "POST" && req.url === "/read") {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
-          const p = this.extractPath(body);
-          if (p) this.glow.activate(p);
+          const ev = this.extractEvent(body);
+          if (ev) this.glow.activate(ev.path, ev.kind);
           ok("ok");
         });
+      } else if (req.method === "POST" && req.url === "/clear-trail") {
+        this.glow.clearTrail();
+        ok("trail cleared");
       } else if (req.url === "/status") {
         const g = this.glow;
         const r = g.getGraphRenderer();
@@ -120,6 +166,7 @@ export default class NeuralVaultPlugin extends Plugin {
           JSON.stringify({
             rafId: g.rafId,
             activation: g.activation.size,
+            traced: g.traced.size,
             lastPaintCount: g.lastPaintCount,
             firstId,
             firstLookupHit: !!firstNode,
@@ -136,7 +183,7 @@ export default class NeuralVaultPlugin extends Plugin {
       } else if (req.method === "POST" && req.url === "/pulse") {
         this.glow.testPulse();
         ok("pulsed");
-      } else if (req.method === "POST" && req.url === "/pulse-all") {
+      } else if (debugOn && req.method === "POST" && req.url === "/pulse-all") {
         // diagnostic: run EVERY node through the normal glow pipeline
         const r = this.glow.getGraphRenderer();
         if (r) {
@@ -144,7 +191,7 @@ export default class NeuralVaultPlugin extends Plugin {
           this.glow.ensureLoop();
         }
         ok("pulse-all " + (r?.nodes?.length ?? 0));
-      } else if (req.method === "POST" && req.url?.startsWith("/reset-view")) {
+      } else if (debugOn && req.method === "POST" && req.url?.startsWith("/reset-view")) {
         const r = this.glow.getGraphRenderer();
         const m = /scale=([\d.]+)/.exec(req.url ?? "");
         if (r) {
@@ -156,7 +203,7 @@ export default class NeuralVaultPlugin extends Plugin {
           r.changed?.();
         }
         ok("reset scale=" + (r?.scale ?? "?"));
-      } else if (req.method === "POST" && req.url?.startsWith("/paint-all")) {
+      } else if (debugOn && req.method === "POST" && req.url?.startsWith("/paint-all")) {
         // diagnostic: replicate the proven mass-color test (node.color + render)
         const r = this.glow.getGraphRenderer();
         const m = /rgb=([0-9a-fA-F]{6})/.exec(req.url ?? "");
@@ -171,7 +218,7 @@ export default class NeuralVaultPlugin extends Plugin {
           r.queueRender?.();
         }
         ok("painted " + painted);
-      } else if (req.method === "POST" && req.url === "/unpaint") {
+      } else if (debugOn && req.method === "POST" && req.url === "/unpaint") {
         const r = this.glow.getGraphRenderer();
         if (r) {
           for (const n of r.nodes) {
@@ -181,7 +228,7 @@ export default class NeuralVaultPlugin extends Plugin {
           r.queueRender?.();
         }
         ok("unpainted");
-      } else if (req.url === "/probe-green") {
+      } else if (debugOn && req.url === "/probe-green") {
         // read back actual rendered pixels via PIXI extract — no human eyes needed
         try {
           const r = this.glow.getGraphRenderer();
@@ -211,7 +258,7 @@ export default class NeuralVaultPlugin extends Plugin {
         } catch (e: any) {
           ok(JSON.stringify({ error: String(e?.message ?? e) }), "application/json");
         }
-      } else if (req.method === "POST" && req.url === "/reload") {
+      } else if (debugOn && req.method === "POST" && req.url === "/reload") {
         ok("reloading");
         window.setTimeout(() => window.location.reload(), 200);
       } else {
@@ -219,11 +266,20 @@ export default class NeuralVaultPlugin extends Plugin {
         res.end();
       }
     });
-    this.server.on("error", (e: Error) =>
-      new Notice("Neural Vault: server error — " + e.message)
-    );
-    this.server.listen(PORT, "127.0.0.1", () =>
-      console.log(`[Neural Vault] listening 127.0.0.1:${PORT}`)
+    const port = this.settings.port || 8765;
+    this.server.on("error", (e: NodeJS.ErrnoException) => {
+      if (e.code === "EADDRINUSE") {
+        new Notice(
+          `Neural Vault: port ${port} is already in use (another vault open?). ` +
+            `Change the port in Settings → Neural Vault.`,
+          10000
+        );
+      } else {
+        new Notice("Neural Vault: server error — " + e.message);
+      }
+    });
+    this.server.listen(port, "127.0.0.1", () =>
+      console.log(`[Neural Vault] listening 127.0.0.1:${port}`)
     );
   }
 
@@ -232,16 +288,23 @@ export default class NeuralVaultPlugin extends Plugin {
     this.server = null;
   }
 
-  extractPath(body: string): string | null {
+  extractEvent(body: string): { path: string; kind: "read" | "write" } | null {
     try {
       const j = JSON.parse(body);
       const abs: string | undefined =
         j?.tool_input?.file_path ?? j?.file_path ?? undefined;
       if (!abs) return null;
       const base: string | undefined = (this.app.vault.adapter as any).basePath;
+      // only light up files that actually belong to THIS vault — with several
+      // vaults open, suffix matching could otherwise glow the wrong graph
+      if (base && abs.startsWith("/") && !abs.startsWith(base)) return null;
       let rel = abs;
       if (base && abs.startsWith(base)) rel = abs.slice(base.length);
-      return rel.replace(/^[/\\]+/, "");
+      const tool: string = j?.tool_name ?? "Read";
+      const kind = /^(Edit|Write|MultiEdit|NotebookEdit)$/i.test(tool)
+        ? ("write" as const)
+        : ("read" as const);
+      return { path: rel.replace(/^[/\\]+/, ""), kind };
     } catch {
       return null;
     }
@@ -261,6 +324,9 @@ class GlowController {
   lastGlowTs = 0; // last applyGlow timestamp, for wall-clock decay
   lastPaintCount = 0; // diagnostics: nodes painted in the last applyGlow pass
   holdUntil = new Map<string, number>(); // per-node: full brightness until this time
+  kinds = new Map<string, "read" | "write">(); // last event kind per node
+  traced = new Map<string, "read" | "write">(); // session trail: faded nodes keep a tint
+  reverseLinks: Map<string, Set<string>> | null = null; // backlink index for cascade
 
   constructor(plugin: NeuralVaultPlugin) {
     this.plugin = plugin;
@@ -292,6 +358,13 @@ class GlowController {
 
   detach() {
     this.stopLoop();
+    // leave the graph exactly as we found it
+    for (const id of [...this.activation.keys()]) this.restoreNode(id);
+    for (const id of [...this.traced.keys()]) this.restoreNode(id);
+    this.activation.clear();
+    this.traced.clear();
+    this.holdUntil.clear();
+    this.forceRender();
     this.renderer = null;
   }
 
@@ -315,6 +388,13 @@ class GlowController {
         if (active) this.applyGlow();
         const moving = s.animateNodes ? this.keepPhysicsWarm(r) : false;
         this.frame++;
+        // session trail: engine repaints can wipe the tint — re-assert periodically
+        if (this.traced.size && this.frame % TRACE_REASSERT_EVERY === 0) {
+          const cfg = parseGlowConfig(s.glowConfig, !s.advanced);
+          for (const id of this.traced.keys()) {
+            if (!this.activation.has(id)) this.paintTrace(id, cfg);
+          }
+        }
         const idleTick = s.keepAwake && this.frame % IDLE_RENDER_EVERY === 0;
         if (active || moving || idleTick) this.forceRender();
       }
@@ -349,21 +429,69 @@ class GlowController {
     this.rafId = null;
   }
 
-  activate(path: string) {
+  activate(path: string, kind: "read" | "write" = "read") {
     if (!this.ensureAttached()) return;
     const node = this.findNode(path);
-    if (node) {
-      const id = this.nodeId(node);
-      const cfg = parseGlowConfig(
-        this.plugin.settings.glowConfig,
-        !this.plugin.settings.advanced
-      );
-      this.activation.set(id, 1);
-      this.holdUntil.set(id, performance.now() + cfg.holdSecs * 1000);
-      this.ensureLoop();
-    } else {
+    if (!node) {
       console.log("[Neural Vault] no node matched for", path);
+      return;
     }
+    const id = this.nodeId(node);
+    const cfg = parseGlowConfig(
+      this.plugin.settings.glowConfig,
+      !this.plugin.settings.advanced
+    );
+    const now = performance.now();
+    this.activation.set(id, 1);
+    this.kinds.set(id, kind);
+    this.holdUntil.set(id, now + cfg.holdSecs * 1000);
+    this.traced.delete(id); // back to live glow; re-traced when it fades out
+
+    // cascade: light direct neighbors at reduced brightness (synaptic spread)
+    if (cfg.cascade > 0) {
+      for (const nb of this.neighborsOf(id)) {
+        const cur = this.activation.get(nb) ?? 0;
+        if (cur >= cfg.cascade) continue; // never dim a stronger activation
+        this.activation.set(nb, cfg.cascade);
+        if (!this.kinds.has(nb)) this.kinds.set(nb, kind);
+        // neighbors get a shorter hold so the source stays the protagonist
+        this.holdUntil.set(
+          nb,
+          Math.max(this.holdUntil.get(nb) ?? 0, now + cfg.holdSecs * 400)
+        );
+        this.traced.delete(nb);
+      }
+    }
+    this.ensureLoop();
+  }
+
+  // direct neighbors (outgoing + incoming links) of a node, by vault path
+  neighborsOf(id: string): string[] {
+    const mc = this.plugin.app.metadataCache;
+    const resolved = mc.resolvedLinks ?? {};
+    const out = Object.keys(resolved[id] ?? {});
+    if (!this.reverseLinks) {
+      const rev = new Map<string, Set<string>>();
+      for (const src in resolved) {
+        for (const dest in resolved[src]) {
+          let s = rev.get(dest);
+          if (!s) rev.set(dest, (s = new Set()));
+          s.add(src);
+        }
+      }
+      this.reverseLinks = rev;
+    }
+    const inc = [...(this.reverseLinks.get(id) ?? [])];
+    return [...new Set([...out, ...inc])];
+  }
+
+  clearTrail() {
+    for (const id of [...this.traced.keys()]) {
+      if (!this.activation.has(id)) this.restoreNode(id);
+    }
+    this.traced.clear();
+    this.forceRender();
+    new Notice("Neural Vault: session trail cleared");
   }
 
   testPulse() {
@@ -448,7 +576,8 @@ class GlowController {
     this.origScale.set(id, n.circle?.scale?.x ?? 1);
   }
 
-  restore(id: string) {
+  // full restore: node returns to its untouched look
+  restoreNode(id: string) {
     const n = this.nodeByIdFast(id);
     if (n) {
       n.color = this.origColor.get(id) ?? null;
@@ -458,6 +587,31 @@ class GlowController {
     }
     this.origColor.delete(id);
     this.origScale.delete(id);
+    this.kinds.delete(id);
+  }
+
+  // a glow finished fading: either restore fully or leave the session-trail tint
+  onFadeOut(id: string, cfg: GlowCfg) {
+    if (cfg.trace > 0) {
+      this.traced.set(id, this.kinds.get(id) ?? "read");
+      this.paintTrace(id, cfg);
+      // scale back to normal — only the tint stays
+      const n = this.nodeByIdFast(id);
+      const s = this.origScale.get(id) ?? 1;
+      n?.circle?.scale?.set?.(s, s);
+    } else {
+      this.restoreNode(id);
+    }
+  }
+
+  paintTrace(id: string, cfg: GlowCfg) {
+    const n = this.nodeByIdFast(id);
+    if (!n) return;
+    const base = this.origColor.get(id);
+    const fromRgb = base && typeof base.rgb === "number" ? base.rgb : 0x888f9c;
+    const kindColor = this.traced.get(id) === "write" ? cfg.writeColor : cfg.color;
+    n.color = { a: 1, rgb: lerpInt(fromRgb, kindColor, cfg.trace) };
+    n.render?.();
   }
 
   // Drive the glow through the node's own color + size, then node.render() — the
@@ -484,7 +638,8 @@ class GlowController {
       const k = Math.min(1, Math.sqrt(a) * pulse);
       const base = this.origColor.get(id);
       const fromRgb = base && typeof base.rgb === "number" ? base.rgb : 0x888f9c;
-      n.color = { a: 1, rgb: lerpInt(fromRgb, cfg.color, k) };
+      const kindColor = this.kinds.get(id) === "write" ? cfg.writeColor : cfg.color;
+      n.color = { a: 1, rgb: lerpInt(fromRgb, kindColor, k) };
       n.render?.(); // applies color (NEVER touch n.weight — engine resets color)
       // swell via the PIXI sprite, applied after render (render resets transform)
       const baseScale = this.origScale.get(id) ?? 1;
@@ -493,12 +648,12 @@ class GlowController {
     }
     this.lastPaintCount = painted;
 
-    // decay + restore finished nodes (hold keeps full brightness first)
+    // decay + finish faded nodes (hold keeps full brightness first)
     for (const [id, v] of this.activation) {
       if ((this.holdUntil.get(id) ?? 0) > t) continue; // still holding
       const nv = v * decayFactor;
       if (nv < 0.01) {
-        this.restore(id);
+        this.onFadeOut(id, cfg);
         this.activation.delete(id);
         this.holdUntil.delete(id);
       } else {
@@ -624,6 +779,33 @@ class NeuralSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Listener port")
+      .setDesc(
+        "Localhost port the Claude Code hook posts to (default 8765). Use a different port per vault if you run several at once. Requires reload; remember to update the port in the vault's .claude/settings.json hook too."
+      )
+      .addText((tx) =>
+        tx.setValue(String(this.plugin.settings.port)).onChange(async (v) => {
+          const p = parseInt(v, 10);
+          if (p >= 1024 && p <= 65535) {
+            this.plugin.settings.port = p;
+            await this.plugin.saveSettings();
+          }
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Debug endpoints")
+      .setDesc(
+        "Expose extra localhost endpoints for development (/pulse-all, /paint-all, /probe-green, /reset-view, /reload). Off for normal use."
+      )
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.debugEndpoints).onChange(async (v) => {
+          this.plugin.settings.debugEndpoints = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
       .setName("Liveliness")
       .setDesc(
         "How much energy to keep in the physics sim. 0 = still, low = gentle drift, high = constantly reshuffling."
@@ -661,11 +843,14 @@ class NeuralSettingTab extends PluginSettingTab {
     const li = (html: string) => {
       legend.createEl("li").innerHTML = html;
     };
-    li('<code>color</code> — glow color, hex string e.g. <code>"#3BDB63"</code>');
+    li('<code>color</code> — Read glow, hex string e.g. <code>"#3BDB63"</code>');
+    li('<code>writeColor</code> — Edit/Write glow, e.g. <code>"#FF8C42"</code>');
     li('<code>swell</code> — node growth; <code>2.0</code> ≈ 3× size, <code>0</code> = none');
     li('<code>hold</code> — seconds at full brightness before fading (e.g. <code>2.5</code>)');
     li('<code>decay</code> — fade length <code>0</code>–<code>1</code> (0.1 quick · 0.5 medium · 1 long)');
     li('<code>pulse</code> — throb <code>0</code>–<code>0.9</code> (<code>0</code> = steady)');
+    li('<code>cascade</code> — neighbor spread <code>0</code>–<code>1</code> (<code>0</code> = off)');
+    li('<code>trace</code> — session-trail tint <code>0</code>–<code>0.5</code> (<code>0</code> = off)');
     li("missing/invalid keys fall back to defaults");
 
     const ta = wrap.createEl("textarea");
