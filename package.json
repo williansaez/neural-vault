@@ -1,0 +1,23 @@
+{
+  "name": "neural-vault",
+  "version": "0.1.0",
+  "description": "Lights up graph nodes like a brain as Claude Code reads your notes.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "keywords": ["obsidian", "graph", "claude"],
+  "author": "willian",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.5",
+    "obsidian": "latest",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "force-graph": "^1.43.5"
+  }
+}
