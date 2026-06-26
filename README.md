@@ -1,8 +1,18 @@
 # Neural Vault
 
-> **Beta** — watch your Obsidian vault light up like a brain while Claude Code reads it.
+**An Obsidian community plugin (beta) — desktop only — pairs with [Claude Code](https://claude.com/claude-code).**
+It animates Obsidian's *native* graph view: nodes flash as Claude Code reads and edits the notes in your vault.
 
-Neural Vault makes nodes in Obsidian's **native graph view** glow as [Claude Code](https://claude.com/claude-code) reads notes in your vault. Every file the agent touches flashes green on the graph — your knowledge base looks like neurons firing.
+![Neural Vault demo](docs/demo.gif)
+
+> Watch your vault light up like a brain. Every file the agent touches flashes on the graph — your knowledge base looks like neurons firing.
+
+## What this is — and isn't
+
+- ✅ A **visualizer**: it drives Obsidian's built-in graph view to glow on agent activity.
+- ✅ An **observability toy**: see at a glance which notes Claude just read or changed.
+- ❌ Not a vault, note store, or memory/RAG system — it stores nothing of its own.
+- ❌ Not required by Claude Code — Claude works fine without it; this is eye-candy for your graph.
 
 ## How it works
 
@@ -17,6 +27,12 @@ node matched on the native graph → glows green, swells, fades
 ```
 
 The plugin drives Obsidian's built-in PIXI graph renderer directly — no separate view. It also keeps the graph "alive": the render cooldown is disabled and the force simulation stays warm, so nodes keep drifting under their real physics instead of freezing.
+
+## Requirements
+
+- Obsidian ≥ 1.4.0 (tested on 1.12.x, macOS) — desktop only (`isDesktopOnly`)
+- Claude Code **CLI** — the Claude desktop app (Cowork) doesn't fire hooks
+- Node (build only) — no prebuilt release yet, so you build `main.js` yourself
 
 ## Install (beta, manual)
 
@@ -85,6 +101,19 @@ Then run `claude` inside the vault, ask it to read some notes, and watch the gra
 
 Always on: `POST /read` (hook target) · `GET /status` · `POST /pulse` · `POST /clear-trail`
 With debug enabled: `POST /pulse-all` · `POST /paint-all` · `POST /unpaint` · `POST /reset-view?scale=` · `GET /probe-green` · `POST /reload`
+
+## Troubleshooting
+
+**Nothing lights up?** Almost always a **port mismatch**. The port in the hook URL
+(`http://127.0.0.1:<port>/read`) must match the plugin's **Listener port**
+(Settings → Neural Vault, default `8765`). The hook's `curl` is silenced
+(`--max-time 1 … >/dev/null 2>&1`), so a wrong port fails with no error — it looks
+broken, not misconfigured.
+
+Quick checks:
+- `curl http://127.0.0.1:8765/status` → should respond. No response = plugin off, Obsidian not reloaded, or wrong port.
+- Reload Obsidian (Cmd+R) after enabling the plugin or changing the port.
+- Running several vaults? One port each, and update each vault's hook URL to match.
 
 ## Beta caveats
 
