@@ -10,7 +10,8 @@
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "skipLibCheck": true,
-    "lib": ["DOM", "ES2018", "ES2020"]
+    "lib": ["DOM", "ES2018", "ES2020"],
+    "types": ["node"]
   },
   "include": ["src/**/*.ts"]
 }

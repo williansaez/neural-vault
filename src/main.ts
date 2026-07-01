@@ -207,7 +207,8 @@ export default class NeuralVaultPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const data = (await this.loadData()) as Partial<NeuralSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
   }
 
   async saveSettings() {
@@ -226,8 +227,8 @@ export default class NeuralVaultPlugin extends Plugin {
         const MAX_BODY = 4 * 1024 * 1024;
         let body = "";
         let truncated = false;
-        req.on("data", (c) => {
-          if (body.length < MAX_BODY) body += c;
+        req.on("data", (c: Buffer) => {
+          if (body.length < MAX_BODY) body += c.toString();
           else truncated = true;
         });
         req.on("end", () => {
