@@ -1,6 +1,6 @@
 {
   "name": "neural-vault",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Lights up graph nodes like a brain as Claude Code reads your notes.",
   "main": "main.js",
   "scripts": {
@@ -12,7 +12,6 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
-    "builtin-modules": "^3.3.0",
     "esbuild": "^0.21.5",
     "obsidian": "latest",
     "typescript": "^5.4.5"

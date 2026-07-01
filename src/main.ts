@@ -1,4 +1,11 @@
-import { Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import {
+  App,
+  FileSystemAdapter,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+} from "obsidian";
 import * as http from "http";
 
 const IDLE_RENDER_EVERY = 6; // when awake but no glow, repaint every Nth frame (~10fps)
@@ -46,6 +53,70 @@ interface GlowCfg {
   cascade: number; // 0..1 neighbor activation level
   trace: number; // 0..0.5 persistent session-trail tint
 }
+
+// ---- Minimal shapes for Obsidian's UNDOCUMENTED core graph renderer. ----
+// The graph view exposes no public API, so we describe only the fields we
+// actually touch. Anything wider is cast locally where it's read.
+interface GlowColor {
+  a: number;
+  rgb: number;
+}
+interface PixiScale {
+  x?: number;
+  set?: (x: number, y: number) => void;
+}
+interface PixiSprite {
+  scale?: PixiScale;
+  tint?: number;
+  alpha?: number;
+}
+interface GraphNode {
+  id?: string;
+  name?: string;
+  color?: GlowColor | null;
+  weight?: number;
+  circle?: PixiSprite;
+  render?: () => void;
+}
+interface PixiExtract {
+  canvas: (stage: unknown) => HTMLCanvasElement;
+}
+interface GraphRenderer {
+  nodes?: GraphNode[];
+  graph?: { nodes?: GraphNode[] };
+  nodeLookup?: Record<string, GraphNode | undefined>;
+  idleFrames?: number;
+  scale?: number;
+  targetScale?: number;
+  worker?: { postMessage?: (msg: unknown) => void };
+  px?: { stage?: unknown; ticker?: unknown; renderer?: { extract?: PixiExtract } };
+  queueRender?: () => void;
+  changed?: () => void;
+  render?: () => void;
+  setScale?: (s: number) => void;
+  resetPan?: () => void;
+}
+interface GraphLeafView {
+  renderer?: GraphRenderer;
+}
+// payload posted by the Claude Code PostToolUse hook
+interface HookPayload {
+  tool_name?: string;
+  file_path?: string;
+  tool_input?: { file_path?: string; notebook_path?: string };
+}
+// raw advanced-highlight JSON — every field is validated before use
+interface GlowConfigJson {
+  color?: unknown;
+  writeColor?: unknown;
+  swell?: unknown;
+  hold?: unknown;
+  decay?: unknown;
+  pulse?: unknown;
+  cascade?: unknown;
+  trace?: unknown;
+}
+
 // decay knob 0..1 -> visible fade time in real seconds (0.5 ~= 7s).
 // Negative (-1) = never fade: Infinity makes the decay factor exp(0) = 1.
 function decayKnobToSecs(knob: number): number {
@@ -63,7 +134,7 @@ function parseGlowConfig(raw: string, useDefaults: boolean): GlowCfg {
     trace = GLOW_DEFAULTS.trace;
   if (!useDefaults) {
     try {
-      const c = JSON.parse(raw);
+      const c = JSON.parse(raw) as GlowConfigJson;
       if (typeof c.color === "string") color = hexToInt(c.color, color);
       if (typeof c.writeColor === "string")
         writeColor = hexToInt(c.writeColor, writeColor); // bad value keeps red, not green
@@ -100,18 +171,18 @@ export default class NeuralVaultPlugin extends Plugin {
     this.addSettingTab(new NeuralSettingTab(this.app, this));
 
     this.addCommand({
-      id: "neural-vault-dump",
+      id: "dump-graph-internals",
       name: "Dump native graph internals (debug)",
       callback: () => this.glow.dumpInternals(),
     });
     this.addCommand({
-      id: "neural-vault-test",
+      id: "test-pulse",
       name: "Test: pulse a random node",
       callback: () => this.glow.testPulse(),
     });
 
     this.addCommand({
-      id: "neural-vault-clear-trail",
+      id: "clear-session-trail",
       name: "Clear session trail",
       callback: () => this.glow.clearTrail(),
     });
@@ -249,12 +320,16 @@ export default class NeuralVaultPlugin extends Plugin {
           const r = this.glow.getGraphRenderer();
           const px = r?.px;
           const ex = px?.renderer?.extract;
-          if (!ex) {
+          if (!px || !ex) {
             ok(JSON.stringify({ error: "no extract", hasPx: !!px }), "application/json");
             return;
           }
-          const cv: any = ex.canvas(px.stage);
+          const cv = ex.canvas(px.stage);
           const c2d = cv.getContext("2d");
+          if (!c2d) {
+            ok(JSON.stringify({ error: "no 2d context" }), "application/json");
+            return;
+          }
           const img = c2d.getImageData(0, 0, cv.width, cv.height).data;
           let green = 0,
             drawn = 0;
@@ -270,8 +345,9 @@ export default class NeuralVaultPlugin extends Plugin {
             JSON.stringify({ w: cv.width, h: cv.height, drawn, green }),
             "application/json"
           );
-        } catch (e: any) {
-          ok(JSON.stringify({ error: String(e?.message ?? e) }), "application/json");
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          ok(JSON.stringify({ error: msg }), "application/json");
         }
       } else if (debugOn && req.method === "POST" && req.url === "/reload") {
         ok("reloading");
@@ -308,7 +384,7 @@ export default class NeuralVaultPlugin extends Plugin {
       let abs: string | undefined;
       let toolName: string | undefined;
       try {
-        const j = JSON.parse(body);
+        const j = JSON.parse(body) as HookPayload;
         abs =
           j?.tool_input?.file_path ??
           j?.tool_input?.notebook_path ?? // NotebookEdit uses notebook_path
@@ -319,10 +395,13 @@ export default class NeuralVaultPlugin extends Plugin {
         // truncated payload (huge Write bodies): both fields live near the head
         abs = /"(?:file_path|notebook_path)"\s*:\s*"((?:[^"\\]|\\.)+)"/.exec(body)?.[1];
         toolName = /"tool_name"\s*:\s*"([^"]+)"/.exec(body)?.[1];
-        if (abs) abs = JSON.parse(`"${abs}"`); // unescape
+        if (abs) abs = JSON.parse(`"${abs}"`) as string; // unescape
       }
       if (!abs) return null;
-      const base: string | undefined = (this.app.vault.adapter as any).basePath;
+      const adapter = this.app.vault.adapter;
+      // getBasePath() is the public typed accessor — no more (adapter as any)
+      const base =
+        adapter instanceof FileSystemAdapter ? adapter.getBasePath() : undefined;
       // only light up files that actually belong to THIS vault — with several
       // vaults open, suffix matching could otherwise glow the wrong graph
       const isAbsolute = /^([/\\]|[A-Za-z]:[/\\])/.test(abs);
@@ -332,7 +411,7 @@ export default class NeuralVaultPlugin extends Plugin {
         // boundary check: "/Vaults/Work" must not match "/Vaults/Work-Archive"
         (abs.length === base.length || abs[base.length] === "/" || abs[base.length] === "\\");
       if (base && isAbsolute && !inVault) return null;
-      const rel = inVault ? abs.slice(base!.length) : abs;
+      const rel = inVault && base ? abs.slice(base.length) : abs;
       const kind = /^(Edit|Write|MultiEdit|NotebookEdit)$/i.test(toolName ?? "Read")
         ? ("write" as const)
         : ("read" as const);
@@ -346,9 +425,9 @@ export default class NeuralVaultPlugin extends Plugin {
 class GlowController {
   plugin: NeuralVaultPlugin;
   activation = new Map<string, number>();
-  origColor = new Map<string, any>();
+  origColor = new Map<string, GlowColor | null>();
   origScale = new Map<string, number>();
-  renderer: any = null;
+  renderer: GraphRenderer | null = null;
   rafId: number | null = null;
   dumped = false;
   frame = 0;
@@ -382,13 +461,13 @@ class GlowController {
     return this.cachedCfg;
   }
 
-  getGraphRenderer(): any {
+  getGraphRenderer(): GraphRenderer | null {
     const ws = this.plugin.app.workspace;
     const leaf =
       ws.getLeavesOfType("graph")[0] ?? ws.getLeavesOfType("localgraph")[0];
     if (!leaf) return null;
-    const view: any = leaf.view;
-    return view?.renderer ?? null;
+    const view = leaf.view as unknown as GraphLeafView;
+    return view.renderer ?? null;
   }
 
   ensureAttached(): boolean {
@@ -400,7 +479,7 @@ class GlowController {
     }
     this.renderer = r;
     if (!this.dumped) {
-      this.dumpInternals();
+      void this.dumpInternals();
       this.dumped = true;
     }
     return true;
@@ -482,12 +561,13 @@ class GlowController {
   // via alpha decay; there's no public off-switch, so we periodically top up
   // alpha by posting to the worker — exactly what setForces / dragging does.
   // Returns true while the sim is being kept warm (so we keep repainting).
-  keepPhysicsWarm(r: any): boolean {
+  keepPhysicsWarm(r: GraphRenderer): boolean {
     const alpha = this.plugin.settings.liveliness;
-    if (alpha <= 0 || !r.worker?.postMessage) return false;
+    const worker = r.worker;
+    if (alpha <= 0 || !worker || !worker.postMessage) return false;
     const t = performance.now();
     if (t - this.lastReheat >= REHEAT_EVERY_MS) {
-      r.worker.postMessage({ alpha, run: true });
+      worker.postMessage({ alpha, run: true });
       this.lastReheat = t;
     }
     return true;
@@ -593,20 +673,20 @@ class GlowController {
     new Notice(`Neural Vault: pulsed ${sample.length} top nodes`);
   }
 
-  nodes(): any[] {
+  nodes(): GraphNode[] {
     const r = this.renderer;
     if (!r) return [];
     return r.nodes ?? r.graph?.nodes ?? [];
   }
 
-  nodeId(n: any): string {
-    return n?.id ?? n?.name ?? "";
+  nodeId(n: GraphNode): string {
+    return n.id ?? n.name ?? "";
   }
 
-  nodeIndex = new Map<string, any>();
+  nodeIndex = new Map<string, GraphNode>();
   nodeIndexCount = -1;
 
-  nodeByIdFast(id: string): any | null {
+  nodeByIdFast(id: string): GraphNode | null {
     const r = this.renderer;
     if (!r) return null;
     const direct = r.nodeLookup?.[id];
@@ -631,7 +711,7 @@ class GlowController {
     return hit ?? null;
   }
 
-  findNode(path: string): any | null {
+  findNode(path: string): GraphNode | null {
     const fast = this.nodeByIdFast(path);
     if (fast) return fast;
     const nodes = this.nodes();
@@ -656,7 +736,7 @@ class GlowController {
     else if (typeof r.changed === "function") r.changed();
   }
 
-  capture(id: string, n: any) {
+  capture(id: string, n: GraphNode) {
     if (this.origColor.has(id)) return;
     this.origColor.set(id, n.color ?? null);
     this.origScale.set(id, n.circle?.scale?.x ?? 1);
@@ -762,36 +842,43 @@ class GlowController {
     }
   }
 
-  async dumpInternals() {
+  async dumpInternals(): Promise<void> {
     const r = this.renderer ?? this.getGraphRenderer();
-    const out: any = { ts: new Date().toISOString() };
+    const out: Record<string, unknown> = { ts: new Date().toISOString() };
     if (!r) {
       out.error = "no renderer (open the graph view)";
     } else {
+      // reflective debug dump: read arbitrary keys off the private object
+      const rec = r as unknown as Record<string, unknown>;
       out.rendererKeys = Object.keys(r);
       // collect callable methods up the prototype chain
       const methods = new Set<string>();
-      let proto = Object.getPrototypeOf(r);
+      let proto: object | null = Object.getPrototypeOf(r) as object | null;
       while (proto && proto !== Object.prototype) {
         for (const k of Object.getOwnPropertyNames(proto)) {
           try {
-            if (typeof r[k] === "function") methods.add(k);
+            if (typeof rec[k] === "function") methods.add(k);
           } catch {
             /* getter may throw */
           }
         }
-        proto = Object.getPrototypeOf(proto);
+        proto = Object.getPrototypeOf(proto) as object | null;
       }
       out.rendererMethods = [...methods].sort();
       out.hasChanged = typeof r.changed === "function";
       out.hasRender = typeof r.render === "function";
       out.hasPx = !!r.px;
-      out.hasPxTicker = !!r?.px?.ticker;
+      out.hasPxTicker = !!r.px?.ticker;
       const nodes = r.nodes ?? r.graph?.nodes ?? [];
       out.nodeCount = nodes.length;
-      out.nodesField = r.nodes ? "renderer.nodes" : r.graph?.nodes ? "renderer.graph.nodes" : "??";
+      out.nodesField = r.nodes
+        ? "renderer.nodes"
+        : r.graph?.nodes
+        ? "renderer.graph.nodes"
+        : "??";
       if (nodes.length) {
         const n = nodes[0];
+        const nrec = n as unknown as Record<string, unknown>;
         out.sampleNodeKeys = Object.keys(n);
         out.sampleNodeId = n.id ?? n.name ?? null;
         out.sampleNodeColor = n.color ?? null;
@@ -802,8 +889,16 @@ class GlowController {
             break;
           }
         }
-        const sprite = n.circle ?? n.graphics ?? n.sprite ?? null;
-        out.spriteField = n.circle ? "circle" : n.graphics ? "graphics" : n.sprite ? "sprite" : "??";
+        const sprite = (n.circle ?? nrec.graphics ?? nrec.sprite ?? null) as
+          | Record<string, unknown>
+          | null;
+        out.spriteField = n.circle
+          ? "circle"
+          : nrec.graphics
+          ? "graphics"
+          : nrec.sprite
+          ? "sprite"
+          : "??";
         if (sprite) {
           out.spriteKeys = Object.keys(sprite);
           out.spriteHasTint = typeof sprite.tint;
@@ -816,7 +911,7 @@ class GlowController {
     try {
       await this.plugin.app.vault.adapter.write(".neural-vault-debug.json", json);
       new Notice("Neural Vault: dumped internals -> .neural-vault-debug.json");
-    } catch (e) {
+    } catch {
       new Notice("Neural Vault: dump write failed");
     }
     console.log("[Neural Vault] internals", out);
@@ -826,7 +921,7 @@ class GlowController {
 class NeuralSettingTab extends PluginSettingTab {
   plugin: NeuralVaultPlugin;
 
-  constructor(app: any, plugin: NeuralVaultPlugin) {
+  constructor(app: App, plugin: NeuralVaultPlugin) {
     super(app, plugin);
     this.plugin = plugin;
   }
@@ -918,7 +1013,6 @@ class NeuralSettingTab extends PluginSettingTab {
         s
           .setLimits(0, 0.4, 0.02)
           .setValue(this.plugin.settings.liveliness)
-          .setDynamicTooltip()
           .onChange(async (v) => {
             this.plugin.settings.liveliness = v;
             await this.plugin.saveSettings();
@@ -974,9 +1068,9 @@ class NeuralSettingTab extends PluginSettingTab {
       }
     };
     validate();
-    ta.addEventListener("input", async () => {
+    ta.addEventListener("input", () => {
       this.plugin.settings.glowConfig = ta.value;
-      await this.plugin.saveSettings();
+      void this.plugin.saveSettings();
       validate();
     });
 
@@ -984,9 +1078,9 @@ class NeuralSettingTab extends PluginSettingTab {
       text: "Reset to default",
       cls: "nv-glow-reset",
     });
-    reset.onclick = async () => {
+    reset.onclick = () => {
       this.plugin.settings.glowConfig = DEFAULT_GLOW;
-      await this.plugin.saveSettings();
+      void this.plugin.saveSettings();
       this.display();
     };
   }

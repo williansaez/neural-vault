@@ -1,5 +1,5 @@
 import esbuild from "esbuild";
-import builtins from "builtin-modules";
+import { builtinModules } from "module";
 
 const prod = process.argv.includes("production");
 
@@ -7,7 +7,7 @@ esbuild
   .build({
     entryPoints: ["src/main.ts"],
     bundle: true,
-    external: ["obsidian", "electron", ...builtins],
+    external: ["obsidian", "electron", ...builtinModules],
     format: "cjs",
     target: "es2018",
     platform: "browser",
