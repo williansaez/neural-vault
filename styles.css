@@ -1,0 +1,50 @@
+/* Neural Vault — Advanced highlight settings editor */
+
+.nv-glow-editor {
+  margin: 4px 0 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 10px;
+  background: var(--background-secondary);
+}
+
+.nv-glow-editor-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.nv-glow-legend {
+  margin: 0 0 12px;
+  padding-left: 18px;
+  font-size: var(--font-ui-smaller);
+  line-height: 1.7;
+  color: var(--text-muted);
+}
+
+.nv-glow-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  line-height: 1.5;
+  padding: 10px 12px;
+  border-radius: 6px;
+}
+
+.nv-glow-status {
+  font-size: var(--font-ui-smaller);
+  margin-top: 8px;
+}
+
+.nv-glow-status.is-valid {
+  color: var(--text-success);
+}
+
+.nv-glow-status.is-invalid {
+  color: var(--text-error);
+}
+
+.nv-glow-reset {
+  margin-top: 12px;
+}

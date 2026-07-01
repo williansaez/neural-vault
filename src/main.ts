@@ -927,25 +927,23 @@ class NeuralSettingTab extends PluginSettingTab {
   }
 
   renderGlowEditor(containerEl: HTMLElement) {
-    const wrap = containerEl.createDiv();
-    wrap.style.margin = "4px 0 18px";
-    wrap.style.padding = "14px 16px";
-    wrap.style.border = "1px solid var(--background-modifier-border)";
-    wrap.style.borderRadius = "10px";
-    wrap.style.background = "var(--background-secondary)";
+    const wrap = containerEl.createDiv({ cls: "nv-glow-editor" });
 
-    const title = wrap.createEl("div", { text: "Highlight style (JSON)" });
-    title.style.fontWeight = "600";
-    title.style.marginBottom = "8px";
+    wrap.createEl("div", {
+      text: "Highlight style (JSON)",
+      cls: "nv-glow-editor-title",
+    });
 
-    const legend = wrap.createEl("ul");
-    legend.style.margin = "0 0 12px";
-    legend.style.paddingLeft = "18px";
-    legend.style.fontSize = "var(--font-ui-smaller)";
-    legend.style.lineHeight = "1.7";
-    legend.style.color = "var(--text-muted)";
-    const li = (html: string) => {
-      legend.createEl("li").innerHTML = html;
+    const legend = wrap.createEl("ul", { cls: "nv-glow-legend" });
+    // build "text <code>x</code> text" as real DOM nodes, no raw markup
+    const li = (markup: string) => {
+      const item = legend.createEl("li");
+      for (const part of markup.split(/(<code>.*?<\/code>)/g)) {
+        if (!part) continue;
+        const m = /^<code>(.*)<\/code>$/.exec(part);
+        if (m) item.createEl("code", { text: m[1] });
+        else item.appendText(part);
+      }
     };
     li('<code>color</code> — Read glow, hex string e.g. <code>"#00ff00"</code>');
     li('<code>writeColor</code> — Edit/Write glow, e.g. <code>"#ff0000"</code>');
@@ -957,30 +955,22 @@ class NeuralSettingTab extends PluginSettingTab {
     li('<code>trace</code> — session-trail tint <code>0</code>–<code>0.5</code> (<code>0</code> = off)');
     li("missing/invalid keys fall back to defaults");
 
-    const ta = wrap.createEl("textarea");
+    const ta = wrap.createEl("textarea", { cls: "nv-glow-textarea" });
     ta.value = this.plugin.settings.glowConfig;
     ta.spellcheck = false;
     ta.rows = 8;
-    ta.style.width = "100%";
-    ta.style.boxSizing = "border-box";
-    ta.style.resize = "vertical";
-    ta.style.fontFamily = "var(--font-monospace)";
-    ta.style.fontSize = "var(--font-ui-small)";
-    ta.style.lineHeight = "1.5";
-    ta.style.padding = "10px 12px";
-    ta.style.borderRadius = "6px";
 
-    const status = wrap.createEl("div");
-    status.style.fontSize = "var(--font-ui-smaller)";
-    status.style.marginTop = "8px";
+    const status = wrap.createEl("div", { cls: "nv-glow-status" });
     const validate = () => {
       try {
         JSON.parse(ta.value);
         status.setText("✓ valid JSON");
-        status.style.color = "var(--text-success)";
+        status.removeClass("is-invalid");
+        status.addClass("is-valid");
       } catch {
         status.setText("✗ invalid JSON — using defaults until fixed");
-        status.style.color = "var(--text-error)";
+        status.removeClass("is-valid");
+        status.addClass("is-invalid");
       }
     };
     validate();
@@ -990,8 +980,10 @@ class NeuralSettingTab extends PluginSettingTab {
       validate();
     });
 
-    const reset = wrap.createEl("button", { text: "Reset to default" });
-    reset.style.marginTop = "12px";
+    const reset = wrap.createEl("button", {
+      text: "Reset to default",
+      cls: "nv-glow-reset",
+    });
     reset.onclick = async () => {
       this.plugin.settings.glowConfig = DEFAULT_GLOW;
       await this.plugin.saveSettings();
