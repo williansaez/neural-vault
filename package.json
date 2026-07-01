@@ -1,6 +1,6 @@
 {
   "name": "neural-vault",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Lights up graph nodes like a brain as Claude Code reads your notes.",
   "main": "main.js",
   "scripts": {
