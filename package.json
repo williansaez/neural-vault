@@ -1,6 +1,6 @@
 {
   "name": "neural-vault",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Lights up graph nodes like a brain as Claude Code reads your notes.",
   "main": "main.js",
   "scripts": {
@@ -8,7 +8,7 @@
     "build": "node esbuild.config.mjs production"
   },
   "keywords": ["obsidian", "graph", "claude"],
-  "author": "willian",
+  "author": "Willian Saez",
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.11.0",
